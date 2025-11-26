@@ -199,9 +199,8 @@ class ExcelPredictionManager:
 
     def extract_points_and_winner(self, message_text: str):
         """
-        Extrait les points et détermine le gagnant à partir du message
+        Extrait les points du Joueur et du Banquier.
         Format: #N620. 1(4♠️7♦️J♣️) - ✅4(9♣️5♠️) #T5
-        Le ✅ indique le gagnant réel
         """
         try:
             # Chercher les groupes de points avec leurs symboles
@@ -211,25 +210,11 @@ class ExcelPredictionManager:
 
             if len(matches) >= 2:
                 # Premier groupe = Joueur, Deuxième groupe = Banquier
-                joueur_win_symbol, joueur_point_str = matches[0]
-                banquier_win_symbol, banquier_point_str = matches[1]
+                _joueur_win_symbol, joueur_point_str = matches[0]
+                _banquier_win_symbol, banquier_point_str = matches[1]
 
                 joueur_point = int(joueur_point_str)
                 banquier_point = int(banquier_point_str)
-
-                # Le gagnant est indiqué par le symbole ✅
-                if joueur_win_symbol:
-                    actual_winner = "joueur"
-                elif banquier_win_symbol:
-                    actual_winner = "banquier"
-                else:
-                    # Fallback: comparer les points si pas de ✅
-                    if joueur_point > banquier_point:
-                        actual_winner = "joueur"
-                    elif banquier_point > joueur_point:
-                        actual_winner = "banquier"
-                    else:
-                        actual_winner = None  # Égalité
 
                 return joueur_point, banquier_point
 
@@ -240,7 +225,7 @@ class ExcelPredictionManager:
 
     def verify_excel_prediction(self, game_number: int, message_text: str, predicted_numero: int, expected_winner: str, current_offset: int):
         """
-        Vérifie une prédiction Excel avec calcul des points pour déterminer le gagnant.
+        Vérifie une prédiction Excel avec la nouvelle logique basée sur les seuils de points du joueur (6.5 ou 4.5).
 
         Args:
             game_number: Numéro du jeu actuel
@@ -251,7 +236,7 @@ class ExcelPredictionManager:
 
         Returns:
             tuple: (status, should_continue)
-                - status: '✅0️⃣', '✅1️⃣', '✅2️⃣', '⭕✍🏻', ou None
+                - status: '✅0️⃣', '✅1️⃣', '✅2️⃣', '❌', ou None
                 - should_continue: True si on doit continuer à vérifier, False si terminé
         """
         try:
@@ -266,11 +251,10 @@ class ExcelPredictionManager:
             # Si l'offset est trop grand, c'est un échec définitif
             if real_offset_from_game > 2:
                 print(f"❌ Prédiction Excel #{predicted_numero}: offset {real_offset_from_game} > 2, échec définitif")
-                return '⭕✍🏻', False
+                return '❌', False  # MODIFIÉ : ⭕✍🏻 -> ❌
 
             # Vérifier que l'offset passé correspond à l'offset réel
             if current_offset != real_offset_from_game:
-                print(f"⚠️ Incohérence offset: current_offset={current_offset}, real={real_offset_from_game}")
                 # Utiliser l'offset réel calculé
                 current_offset = real_offset_from_game
 
@@ -292,66 +276,91 @@ class ExcelPredictionManager:
             # Extraire les points
             joueur_point, banquier_point = self.extract_points_and_winner(message_text)
 
+            # --- NOUVELLE LOGIQUE DE VÉRIFICATION BASÉE SUR LES SEUILS DE POINTS DU JOUEUR (premier groupe) ---
+
             if joueur_point is None or banquier_point is None:
                 # Si c'est une incohérence critique (✅ mal placé), marquer comme échec
                 if '✅' in message_text and not '🔰' in message_text:
                     print(f"❌ CRITIQUE: Message avec ✅ incohérent - échec de la prédiction #{predicted_numero}")
-                    return '⭕✍🏻', False
+                    return '❌', False # MODIFIÉ : ⭕✍🏻 -> ❌
                 else:
                     # Sinon, continuer à attendre (peut-être un message incomplet)
                     print(f"⚠️ Impossible d'extraire les points, on continue")
-                    return None, True
+                    return None, True 
 
-            # Déterminer le gagnant réel selon les points
-            if joueur_point > banquier_point:
-                actual_winner = "joueur"
-            elif banquier_point > joueur_point:
-                actual_winner = "banquier"
-            else:
-                # Match nul - traiter comme échec pour les prédictions
-                print(f"⚠️ Match nul détecté (J:{joueur_point} = B:{banquier_point}), passage à offset suivant")
-                return None, True
-
-            # Comparer avec le gagnant attendu
+            # Déterminer le gagnant attendu à partir de la chaîne de caractères
             expected = "banquier" if "banquier" in expected_winner.lower() else "joueur"
+            
+            # Comparaison avec les seuils uniquement sur le point du JOUEUR
+            is_success = False
+            
+            if expected == "joueur":
+                # Si on attend JOUEUR (P+6,5), succès si point JOUEUR >= 7 (soit > 6.5)
+                if joueur_point >= 7:
+                    is_success = True
+                    print(f"✅ Succès JOUEUR : Point Joueur ({joueur_point}) >= 7 (Seuil 6.5)")
+                else:
+                    print(f"❌ Échec JOUEUR : Point Joueur ({joueur_point}) < 7 (Seuil 6.5)")
+            
+            elif expected == "banquier":
+                # Si on attend BANQUIER (M-4,,5), succès si point JOUEUR <= 4 (soit < 4.5)
+                if joueur_point <= 4:
+                    is_success = True
+                    print(f"✅ Succès BANQUIER : Point Joueur ({joueur_point}) <= 4 (Seuil 4.5)")
+                else:
+                    print(f"❌ Échec BANQUIER : Point Joueur ({joueur_point}) > 4 (Seuil 4.5)")
+                    
+            print(f"📊 Point Joueur: {joueur_point}, Attendu: {expected}, Succès: {is_success}")
 
-            print(f"📊 Points: Joueur={joueur_point}, Banquier={banquier_point} → Gagnant réel: {actual_winner}, Attendu: {expected}")
+            # Vérifier si on doit continuer la vérification
+            
+            if is_success:
+                # ✅ SUCCÈS ! Terminer la vérification.
+                real_offset = game_number - predicted_numero
 
-            if actual_winner != expected:
-                print(f"❌ Offset {current_offset}: gagnant incorrect - passage à offset suivant")
-                return None, True
+                print(f"✅ Prédiction Excel #{predicted_numero} réussie sur jeu #{game_number} avec point Joueur {joueur_point}")
+                print(f"   Offset: {real_offset}")
 
-            # ✅ SUCCÈS ! L'offset est simplement la différence entre le jeu actuel et le jeu prédit
-            real_offset = game_number - predicted_numero
-
-            print(f"✅ Prédiction Excel #{predicted_numero} réussie sur jeu #{game_number}")
-            print(f"   Points: Joueur={joueur_point}, Banquier={banquier_point}")
-            print(f"   Gagnant réel: {actual_winner}, Attendu: {expected}")
-            print(f"   Offset: {real_offset}")
-
-            if real_offset == 0:
-                return '✅0️⃣', False
-            elif real_offset == 1:
-                return '✅1️⃣', False
-            elif real_offset == 2:
-                return '✅2️⃣', False
+                if real_offset == 0:
+                    return '✅0️⃣', False
+                elif real_offset == 1:
+                    return '✅1️⃣', False
+                elif real_offset == 2:
+                    return '✅2️⃣', False
+                else:
+                    # Si offset > 2, on ne devrait pas arriver ici, mais par sécurité
+                    return '✅2️⃣', False
             else:
-                # Si offset > 2, on ne devrait pas arriver ici, mais par sécurité
-                return '✅2️⃣', False
+                # ❌ ÉCHEC sur cet offset. Continuer si l'offset maximum n'est pas atteint (jusqu'à +2).
+                if current_offset < 2:
+                    print(f"❌ Offset {current_offset}: condition non remplie - passage à offset suivant")
+                    return None, True # Continuer
+                else:
+                    print(f"❌ Échec définitif de la prédiction #{predicted_numero} après offset 2.")
+                    return '❌', False # MODIFIÉ : ⭕✍🏻 -> ❌
 
         except Exception as e:
             print(f"Erreur verify_excel_prediction: {e}")
             return None, True
 
-    def get_prediction_format(self, victoire: str) -> str:
+    def get_prediction_format(self, numero: int, victoire: str) -> str:
+        """
+        Génère le format de prédiction:
+        - Si Joueur: 🔵{numero}:🅿️+6,5🔵statut :⏳
+        - Si Banquier: 🔵{numero}:Ⓜ️-4,,5🔵statut :⏳
+        """
         victoire_lower = victoire.lower()
+        numero_str = str(numero)
 
         if "joueur" in victoire_lower or "player" in victoire_lower:
-            return "👗 𝐕𝟏👗"
+            # Prédiction Joueur (P pour Player, seuil > 6,5)
+            return f"🔵{numero_str}:🅿️+6,5🔵statut :⏳"
         elif "banquier" in victoire_lower or "banker" in victoire_lower:
-            return "👗 𝐕2👗"
+            # Prédiction Banquier (M pour Maison/Banker, seuil < 4,5)
+            return f"🔵{numero_str}:Ⓜ️-4,,5🔵statut :⏳"
         else:
-            return "👗 𝐕𝟏👗"
+            # Par défaut, utiliser le format Joueur si le gagnant n'est pas clair
+            return f"🔵{numero_str}:🅿️+6,5🔵statut :⏳"
 
     def get_pending_predictions(self) -> List[Dict[str, Any]]:
         pending = []
