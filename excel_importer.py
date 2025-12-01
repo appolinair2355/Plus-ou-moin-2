@@ -199,28 +199,30 @@ class ExcelPredictionManager:
 
     def extract_points_and_winner(self, message_text: str):
         """
-        Extrait les points du Joueur et du Banquier.
-        Format: #N620. 1(4♠️7♦️J♣️) - ✅4(9♣️5♠️) #T5
+        Extrait le point du PREMIER GROUPE uniquement (celui qui détermine la victoire).
+        Format attendu: #N123. ✅8(cartes) - 7(cartes) → on extrait le 8
+
+        Le point du premier groupe est celui juste avant la première parenthèse.
+
+        Retourne: (premier_groupe_point, None) pour compatibilité avec le code existant
         """
         try:
-            # Chercher les groupes de points avec leurs symboles
-            # Format: [symbole optionnel]point(cartes)
-            pattern = r"(✅)?(\d+)\([^)]+\)"
-            matches = re.findall(pattern, message_text)
+            # Pattern pour extraire le point du PREMIER groupe (avant la première parenthèse)
+            # Peut avoir ✅ ou 🔰 avant le nombre
+            pattern = r'[✅🔰]?(\d+)\('
+            match = re.search(pattern, message_text)
 
-            if len(matches) >= 2:
-                # Premier groupe = Joueur, Deuxième groupe = Banquier
-                _joueur_win_symbol, joueur_point_str = matches[0]
-                _banquier_win_symbol, banquier_point_str = matches[1]
+            if match:
+                premier_groupe_point = int(match.group(1))
+                print(f"📊 Point du premier groupe extrait: {premier_groupe_point} depuis '{message_text}'")
+                # On retourne le point du premier groupe comme "joueur_point" pour la compatibilité
+                return premier_groupe_point, None
 
-                joueur_point = int(joueur_point_str)
-                banquier_point = int(banquier_point_str)
-
-                return joueur_point, banquier_point
-
+            print(f"⚠️ Impossible d'extraire le point du premier groupe depuis: {message_text}")
             return None, None
+
         except Exception as e:
-            print(f"Erreur extraction points: {e}")
+            print(f"❌ Erreur extraction point premier groupe: {e}")
             return None, None
 
     def verify_excel_prediction(self, game_number: int, message_text: str, predicted_numero: int, expected_winner: str, current_offset: int):
@@ -268,9 +270,15 @@ class ExcelPredictionManager:
             # C'est notre numéro cible, vérifier le résultat
             print(f"🔍 Vérification Excel #{predicted_numero} sur offset interne {current_offset} (numéro {game_number})")
 
-            # Vérifier si le message contient un résultat valide
+            # ATTENTE DES MESSAGES EN ÉDITION: Ne pas ignorer, mais ATTENDRE la finalisation
+            # Le bot recevra un événement MessageEdited quand le message passera de ⏰/🕐 à ✅/🔰
+            if "⏰" in message_text or "🕐" in message_text:
+                print(f"⏰ Message #{game_number} en cours d'édition - ATTENTE de finalisation (✅ ou 🔰)")
+                return None, True  # None = pas de décision, True = continuer à surveiller ce message
+
+            # Vérifier si le message est finalisé (🔰 ou ✅ uniquement)
             if not any(tag in message_text for tag in ["✅", "🔰"]):
-                print(f"⚠️ Message sans tag de résultat, on continue")
+                print(f"⚠️ Message sans tag de finalisation (ni ✅ ni 🔰) - ignoré")
                 return None, True
 
             # Extraire les points
@@ -278,7 +286,7 @@ class ExcelPredictionManager:
 
             # --- NOUVELLE LOGIQUE DE VÉRIFICATION BASÉE SUR LES SEUILS DE POINTS DU JOUEUR (premier groupe) ---
 
-            if joueur_point is None or banquier_point is None:
+            if joueur_point is None: # banquier_point n'est plus utilisé
                 # Si c'est une incohérence critique (✅ mal placé), marquer comme échec
                 if '✅' in message_text and not '🔰' in message_text:
                     print(f"❌ CRITIQUE: Message avec ✅ incohérent - échec de la prédiction #{predicted_numero}")
@@ -286,14 +294,14 @@ class ExcelPredictionManager:
                 else:
                     # Sinon, continuer à attendre (peut-être un message incomplet)
                     print(f"⚠️ Impossible d'extraire les points, on continue")
-                    return None, True 
+                    return None, True
 
             # Déterminer le gagnant attendu à partir de la chaîne de caractères
             expected = "banquier" if "banquier" in expected_winner.lower() else "joueur"
-            
+
             # Comparaison avec les seuils uniquement sur le point du JOUEUR
             is_success = False
-            
+
             if expected == "joueur":
                 # Si on attend JOUEUR (P+6,5), succès si point JOUEUR >= 7 (soit > 6.5)
                 if joueur_point >= 7:
@@ -301,7 +309,7 @@ class ExcelPredictionManager:
                     print(f"✅ Succès JOUEUR : Point Joueur ({joueur_point}) >= 7 (Seuil 6.5)")
                 else:
                     print(f"❌ Échec JOUEUR : Point Joueur ({joueur_point}) < 7 (Seuil 6.5)")
-            
+
             elif expected == "banquier":
                 # Si on attend BANQUIER (M-4,,5), succès si point JOUEUR <= 4 (soit < 4.5)
                 if joueur_point <= 4:
@@ -309,11 +317,11 @@ class ExcelPredictionManager:
                     print(f"✅ Succès BANQUIER : Point Joueur ({joueur_point}) <= 4 (Seuil 4.5)")
                 else:
                     print(f"❌ Échec BANQUIER : Point Joueur ({joueur_point}) > 4 (Seuil 4.5)")
-                    
+
             print(f"📊 Point Joueur: {joueur_point}, Attendu: {expected}, Succès: {is_success}")
 
             # Vérifier si on doit continuer la vérification
-            
+
             if is_success:
                 # ✅ SUCCÈS ! Terminer la vérification.
                 real_offset = game_number - predicted_numero
@@ -321,12 +329,13 @@ class ExcelPredictionManager:
                 print(f"✅ Prédiction Excel #{predicted_numero} réussie sur jeu #{game_number} avec point Joueur {joueur_point}")
                 print(f"   Offset: {real_offset}")
 
+                # L'emoji correspond à l'offset (0 = 1er essai, 1 = 2ème essai, etc.)
                 if real_offset == 0:
-                    return '✅0️⃣', False
+                    return '✅0️⃣', False  # 1er essai
                 elif real_offset == 1:
-                    return '✅1️⃣', False
+                    return '✅1️⃣', False  # 2ème essai
                 elif real_offset == 2:
-                    return '✅2️⃣', False
+                    return '✅2️⃣', False  # 3ème essai
                 else:
                     # Si offset > 2, on ne devrait pas arriver ici, mais par sécurité
                     return '✅2️⃣', False

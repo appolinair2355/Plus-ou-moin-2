@@ -5,7 +5,8 @@ import json
 import zipfile
 import tempfile
 import shutil
-from datetime import datetime
+import glob
+from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon.events import ChatAction
 from dotenv import load_dotenv
@@ -48,11 +49,42 @@ CONFIG_FILE = 'bot_config.json'
 detected_stat_channel = None
 detected_display_channel = None
 confirmation_pending = {}
-prediction_interval = 5  # Intervalle en minutes avant de chercher "A" (défaut: 5 min)
+prediction_interval = 5  # Intervalle en minutes
+
+# Variable pour le décalage de prédiction (N+a)
+a_offset = 1  # Valeur par défaut, modifiable avec /a
+
+# Variable pour l'offset de vérification (r)
+# Définit le nombre d'essais pour vérifier une prédiction (2-10)
+r_offset = 2  # Valeur par défaut, modifiable avec /r
+
+# Emojis de vérification selon l'offset (N+0, N+1, N+2, etc.)
+# L'index correspond au nombre d'essais: 0 = 1er essai, 1 = 2ème essai, etc.
+VERIFICATION_EMOJIS = {
+    0: "✅0️⃣",  # 1er essai (N+0)
+    1: "✅1️⃣",  # 2ème essai (N+1)
+    2: "✅2️⃣",  # 3ème essai (N+2)
+    3: "✅3️⃣",  # 4ème essai (N+3)
+    4: "✅4️⃣",  # 5ème essai (N+4)
+    5: "✅5️⃣",  # 6ème essai (N+5)
+    6: "✅6️⃣",  # 7ème essai (N+6)
+    7: "✅7️⃣",  # 8ème essai (N+7)
+    8: "✅8️⃣",  # 9ème essai (N+8)
+    9: "✅9️⃣",  # 10ème essai (N+9)
+    10: "✅🔟"  # 11ème essai (N+10)
+}
+
+# Dictionnaire pour stocker les prédictions actives et leur statut
+active_predictions = {}  # {numero_predit: {"message_id": id, "channel_id": id, "expected": "joueur/banquier", "attempts": 0}}
+
+# Variables pour la détection automatique des fichiers Excel
+EXCEL_WATCH_DIR = "."  # Répertoire à surveiller
+processed_excel_files = set()  # Fichiers déjà traités
+last_excel_check = None  # Dernière vérification
 
 def load_config():
     """Load configuration with priority: JSON > Database > Environment"""
-    global detected_stat_channel, detected_display_channel, prediction_interval
+    global detected_stat_channel, detected_display_channel, prediction_interval, a_offset, r_offset, active_predictions
     try:
         # Toujours essayer JSON en premier (source de vérité)
         if os.path.exists(CONFIG_FILE):
@@ -61,7 +93,10 @@ def load_config():
                 detected_stat_channel = config.get('stat_channel')
                 detected_display_channel = config.get('display_channel', DISPLAY_CHANNEL)
                 prediction_interval = config.get('prediction_interval', 1)
-                print(f"✅ Configuration chargée depuis JSON: Stats={detected_stat_channel}, Display={detected_display_channel}, Intervalle={prediction_interval}min")
+                a_offset = config.get('a_offset', 1)
+                r_offset = config.get('r_offset', 2)
+                active_predictions = config.get('active_predictions', {})
+                print(f"✅ Configuration chargée depuis JSON: Stats={detected_stat_channel}, Display={detected_display_channel}, a_offset={a_offset}, r_offset={r_offset}")
                 return
 
         # Fallback sur base de données si JSON n'existe pas
@@ -96,17 +131,21 @@ def save_config():
             db.set_config('stat_channel', detected_stat_channel)
             db.set_config('display_channel', detected_display_channel)
             db.set_config('prediction_interval', prediction_interval)
+            db.set_config('a_offset', a_offset)
             print("💾 Configuration sauvegardée en base de données")
 
         # Sauvegarde JSON de secours
         config = {
             'stat_channel': detected_stat_channel,
             'display_channel': detected_display_channel,
-            'prediction_interval': prediction_interval
+            'prediction_interval': prediction_interval,
+            'a_offset': a_offset,
+            'r_offset': r_offset,
+            'active_predictions': active_predictions
         }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
-        print(f"💾 Configuration sauvegardée: Stats={detected_stat_channel}, Display={detected_display_channel}, Intervalle={prediction_interval}min")
+        print(f"💾 Configuration sauvegardée: Stats={detected_stat_channel}, Display={detected_display_channel}, a_offset={a_offset}, r_offset={r_offset}")
     except Exception as e:
         print(f"❌ Erreur sauvegarde configuration: {e}")
 
@@ -356,6 +395,370 @@ async def force_set_display_channel(event):
         print(f"Erreur dans force_set_display_channel: {e}")
         await event.respond(f"❌ Erreur: {e}")
 
+@client.on(events.NewMessage(pattern=r'/a\s*(\d+)?'))
+async def set_a_offset(event):
+    """Set or show the prediction offset value (N+a)"""
+    global a_offset
+    
+    try:
+        if ADMIN_ID and event.sender_id != ADMIN_ID:
+            await event.respond("❌ Seul l'administrateur peut modifier ce paramètre")
+            return
+        
+        match = event.pattern_match
+        new_value = match.group(1)
+        
+        if new_value:
+            a_offset = int(new_value)
+            save_config()
+            await event.respond(f"✅ **Décalage de prédiction mis à jour**\n\n📊 Nouvelle valeur: **a = {a_offset}**\n\n🎯 Les prédictions seront: N + {a_offset}\n💾 Configuration sauvegardée")
+            print(f"Décalage a_offset mis à jour: {a_offset}")
+        else:
+            await event.respond(f"📊 **Décalage actuel: a = {a_offset}**\n\n🎯 Les prédictions sont: N + {a_offset}\n\n💡 Pour modifier: `/a [valeur]`\nExemple: `/a 3` pour N+3")
+    
+    except Exception as e:
+        print(f"Erreur dans set_a_offset: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+@client.on(events.NewMessage(pattern=r'/r\s*(\d+)?'))
+async def set_r_offset(event):
+    """Set or show the verification offset value (r)"""
+    global r_offset
+    
+    try:
+        if ADMIN_ID and event.sender_id != ADMIN_ID:
+            await event.respond("❌ Seul l'administrateur peut modifier ce paramètre")
+            return
+        
+        match = event.pattern_match
+        new_value = match.group(1)
+        
+        if new_value:
+            value = int(new_value)
+            if value < 0 or value > 10:
+                await event.respond("❌ **Valeur invalide**\n\nL'offset de vérification doit être entre **0** et **10**.\n\n💡 Exemple: `/r 2` pour vérifier N+0, N+1, N+2")
+                return
+            
+            r_offset = value
+            save_config()
+            
+            emoji_list = "\n".join([f"• N+{i}: {VERIFICATION_EMOJIS[i]}" for i in range(0, r_offset + 1)])
+            
+            await event.respond(f"""✅ **Offset de vérification mis à jour**
+
+📊 Nouvelle valeur: **r = {r_offset}**
+
+🎯 Vérification de N+0 à N+{r_offset}
+
+**Emojis de vérification:**
+{emoji_list}
+
+💡 Note: L'emoji indique le nombre d'essais après la première vérification
+   (0 = succès au 1er essai, 1 = succès au 2ème essai, etc.)
+
+💾 Configuration sauvegardée""")
+            print(f"Offset r_offset mis à jour: {r_offset}")
+        else:
+            emoji_list = "\n".join([f"• N+{i}: {VERIFICATION_EMOJIS[i]}" for i in range(0, r_offset + 1)])
+            
+            await event.respond(f"""📊 **Offset de vérification actuel: r = {r_offset}**
+
+🎯 Vérification de N+0 à N+{r_offset}
+
+**Emojis de vérification:**
+{emoji_list}
+
+💡 Pour modifier: `/r [valeur]` (0-10)
+Exemple: `/r 2` pour vérifier N+0, N+1, N+2""")
+    
+    except Exception as e:
+        print(f"Erreur dans set_r_offset: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+# --- FONCTIONS D'ANALYSE DES MESSAGES DU CANAL SOURCE ---
+
+def extract_card_value(card: str) -> str:
+    """Extrait la valeur d'une carte (A, K, Q, J, 10, 9, 8, 7, 6, 5, 4, 3, 2)"""
+    card_values = ['10', 'A', 'K', 'Q', 'J', '9', '8', '7', '6', '5', '4', '3', '2']
+    for val in card_values:
+        if val in card:
+            return val
+    return ""
+
+def has_six_in_first_group(message_text: str) -> bool:
+    """
+    Vérifie si le premier groupe de cartes contient une carte de valeur 6.
+    Exemple: A♠️6♠️ contient un 6, mais 3♠️3♠️ ne contient pas de 6.
+    """
+    try:
+        pattern = r"[✅🔰]?\d+\(([^)]+)\)"
+        matches = re.findall(pattern, message_text)
+        if matches and len(matches) >= 1:
+            first_group = matches[0]
+            card_pattern = r'(\d+|[AKQJ])[♠️♥️♦️♣️♠♥♦♣]'
+            cards = re.findall(card_pattern, first_group)
+            for card_value in cards:
+                if card_value == '6':
+                    print(f"✅ Trouvé une carte 6 dans le premier groupe: {first_group}")
+                    return True
+            print(f"ℹ️ Pas de carte 6 dans le premier groupe: {first_group} (cartes: {cards})")
+        return False
+    except Exception as e:
+        print(f"Erreur has_six_in_first_group: {e}")
+        return False
+
+def has_six_in_both_groups(message_text: str) -> bool:
+    """
+    Vérifie si CHAQUE groupe (premier ET second) contient au moins une carte de valeur 6.
+    Retourne True si les deux groupes contiennent chacun au moins un 6.
+    """
+    try:
+        pattern = r"[✅🔰]?\d+\(([^)]+)\)"
+        matches = re.findall(pattern, message_text)
+        
+        if len(matches) < 2:
+            return False
+        
+        # Vérifier le premier groupe
+        first_group = matches[0]
+        card_pattern = r'(\d+|[AKQJ])[♠️♥️♦️♣️♠♥♦♣]'
+        first_group_cards = re.findall(card_pattern, first_group)
+        has_six_in_first = any(card_value == '6' for card_value in first_group_cards)
+        
+        # Vérifier le second groupe
+        second_group = matches[1]
+        second_group_cards = re.findall(card_pattern, second_group)
+        has_six_in_second = any(card_value == '6' for card_value in second_group_cards)
+        
+        if has_six_in_first and has_six_in_second:
+            print(f"⚠️ EXCLUSION: Premier groupe contient '6' ET second groupe contient '6'")
+            print(f"   Premier groupe: {first_group} (cartes: {first_group_cards})")
+            print(f"   Second groupe: {second_group} (cartes: {second_group_cards})")
+            return True
+        
+        return False
+    except Exception as e:
+        print(f"Erreur has_six_in_both_groups: {e}")
+        return False
+
+def count_sixes_in_groups(message_text: str) -> int:
+    """
+    Compte le nombre total de cartes de valeur 6 dans tous les groupes.
+    Retourne le nombre total de '6' trouvés.
+    """
+    try:
+        pattern = r"[✅🔰]?\d+\(([^)]+)\)"
+        matches = re.findall(pattern, message_text)
+        total_sixes = 0
+        
+        for group in matches:
+            card_pattern = r'(\d+|[AKQJ])[♠️♥️♦️♣️♠♥♦♣]'
+            cards = re.findall(card_pattern, group)
+            sixes_in_group = sum(1 for card_value in cards if card_value == '6')
+            total_sixes += sixes_in_group
+        
+        print(f"📊 Nombre total de '6' trouvés dans tous les groupes: {total_sixes}")
+        return total_sixes
+    except Exception as e:
+        print(f"Erreur count_sixes_in_groups: {e}")
+        return 0
+
+def get_first_group_total(message_text: str) -> int:
+    """Extrait le total du premier groupe (le chiffre avant les parenthèses)"""
+    try:
+        pattern = r"[✅🔰]?(\d+)\(([^)]+)\)"
+        matches = re.findall(pattern, message_text)
+        if matches and len(matches) >= 1:
+            total = int(matches[0][0])
+            print(f"📊 Total du premier groupe: {total}")
+            return total
+        return -1
+    except Exception as e:
+        print(f"Erreur get_first_group_total: {e}")
+        return -1
+
+def extract_t_value(message_text: str) -> float:
+    """Extrait la valeur #T du message"""
+    try:
+        match = re.search(r'#T(\d+(?:\.\d+)?)', message_text)
+        if match:
+            t_value = float(match.group(1))
+            print(f"📊 Valeur #T extraite: {t_value}")
+            return t_value
+        return -1
+    except Exception as e:
+        print(f"Erreur extract_t_value: {e}")
+        return -1
+
+def is_tie_game(message_text: str) -> bool:
+    """
+    Vérifie si c'est un match nul.
+    Format match nul: les deux groupes ont le même score et 🟣#X est présent
+    Exemple: #N25. 5(Q♣️6♥️5♣️) 🔰 5(3♣️9♦️3♠️) #T10 🟣#X
+    """
+    try:
+        if '🟣#X' in message_text:
+            print("🔰 Match nul détecté (🟣#X présent) - pas de prédiction")
+            return True
+        return False
+    except Exception as e:
+        print(f"Erreur is_tie_game: {e}")
+        return False
+
+def should_skip_prediction(message_text: str) -> bool:
+    """
+    Vérifie si on doit ignorer la prédiction:
+    - Match nul (🔰 entre groupes avec 🟣#X)
+    - Premier groupe total = 6 ET contient un 6 dans les cartes
+    - 2 valeurs '6' ou plus dans tous les groupes combinés
+    - Premier groupe contient un 6 ET second groupe contient un 6
+    """
+    if is_tie_game(message_text):
+        return True
+    
+    # Vérifier si les deux groupes contiennent chacun au moins un 6
+    if has_six_in_both_groups(message_text):
+        print(f"⚠️ Les deux groupes contiennent chacun une carte '6' - pas de prédiction")
+        return True
+    
+    # Vérifier s'il y a 2 valeurs '6' ou plus
+    total_sixes = count_sixes_in_groups(message_text)
+    if total_sixes >= 2:
+        print(f"⚠️ Trouvé {total_sixes} cartes '6' dans les groupes - pas de prédiction")
+        return True
+    
+    first_group_total = get_first_group_total(message_text)
+    has_six = has_six_in_first_group(message_text)
+    
+    if first_group_total == 6 and has_six:
+        print(f"⚠️ Total premier groupe = 6 ET contient un 6 - pas de prédiction")
+        return True
+    
+    return False
+
+def is_finalized_message(message_text: str) -> bool:
+    """Vérifie si le message est finalisé (✅ ou 🔰)"""
+    return '✅' in message_text or '🔰' in message_text
+
+async def verify_active_predictions(game_number: int, message_text: str):
+    """
+    Vérifie les prédictions actives basées sur les messages du canal source.
+    
+    Logique de vérification séquentielle:
+    1. Vérifie d'abord à N+0 (numéro exact prédit)
+    2. Si échec et r ≥ 1, continue à N+1
+    3. Si échec et r ≥ 2, continue à N+2
+    4. Marque ❌ si échec après tous les essais autorisés par r_offset
+    """
+    global active_predictions
+    
+    if not is_finalized_message(message_text):
+        return
+    
+    for pred_numero_str in list(active_predictions.keys()):
+        pred_numero = int(pred_numero_str)
+        pred_data = active_predictions[pred_numero_str]
+        
+        # Ignorer si déjà vérifiée
+        if pred_data.get("verified", False):
+            continue
+        
+        # Récupérer le nombre d'essais déjà effectués
+        attempts_done = pred_data.get("attempts", 0)
+        
+        # Si le jeu actuel est avant notre prédiction, ignorer
+        if game_number < pred_numero:
+            continue
+        
+        # Calculer l'offset actuel (combien de jeux après la prédiction)
+        current_offset = game_number - pred_numero
+        
+        # Si on a dépassé le nombre maximum d'essais autorisés, marquer comme échec
+        if current_offset > r_offset:
+            msg_id = pred_data.get("message_id")
+            channel_id = pred_data.get("channel_id")
+            base_text = pred_data.get("base_text", "")
+            
+            if msg_id and channel_id:
+                new_text = base_text.replace("statut :⏳", "statut :❌")
+                try:
+                    await client.edit_message(channel_id, msg_id, new_text)
+                    print(f"❌ Prédiction #{pred_numero} expirée après offset {r_offset}")
+                except Exception as e:
+                    print(f"❌ Erreur mise à jour prédiction expirée #{pred_numero}: {e}")
+            
+            pred_data["verified"] = True
+            pred_data["status"] = "❌"
+            pred_data["attempts"] = r_offset + 1
+            save_config()
+            continue
+        
+        # Vérifier seulement si c'est un offset qu'on n'a pas encore testé
+        if current_offset > attempts_done:
+            msg_id = pred_data.get("message_id")
+            channel_id = pred_data.get("channel_id")
+            expected = pred_data.get("expected", "")
+            
+            if not msg_id or not channel_id:
+                continue
+            
+            # Extraire le point du premier groupe
+            premier_groupe_point, _ = excel_manager.extract_points_and_winner(message_text)
+            
+            if premier_groupe_point is None:
+                print(f"⚠️ Impossible d'extraire le point du premier groupe du jeu #{game_number}")
+                continue
+            
+            # Vérifier si la prédiction est réussie
+            is_success = False
+            if expected == "joueur":
+                # P+6,5 : succès si point > 6.5
+                if premier_groupe_point > 6.5:
+                    is_success = True
+                    print(f"✅ Prédiction #{pred_numero} JOUEUR (P+6,5) réussie à N+{current_offset}: point={premier_groupe_point} > 6.5")
+            elif expected == "banquier":
+                # M-4,5 : succès si point < 4.5
+                if premier_groupe_point < 4.5:
+                    is_success = True
+                    print(f"✅ Prédiction #{pred_numero} BANQUIER (M-4,5) réussie à N+{current_offset}: point={premier_groupe_point} < 4.5")
+            
+            # Mettre à jour le nombre d'essais
+            pred_data["attempts"] = current_offset
+            
+            if is_success:
+                # Succès: marquer avec l'emoji approprié et arrêter
+                status_emoji = VERIFICATION_EMOJIS.get(current_offset, f"✅{current_offset}")
+                base_text = pred_data.get("base_text", "")
+                new_text = base_text.replace("statut :⏳", f"statut :{status_emoji}")
+                
+                try:
+                    await client.edit_message(channel_id, msg_id, new_text)
+                    pred_data["verified"] = True
+                    pred_data["status"] = status_emoji
+                    save_config()
+                    print(f"✅ Prédiction #{pred_numero} validée: {status_emoji} (N+{current_offset})")
+                except Exception as e:
+                    print(f"❌ Erreur mise à jour prédiction #{pred_numero}: {e}")
+            else:
+                # Échec sur cet essai
+                print(f"⏳ Prédiction #{pred_numero} échec à N+{current_offset} (essai {current_offset + 1}/{r_offset + 1})")
+                
+                # Si c'est le dernier essai autorisé, marquer comme échec définitif
+                if current_offset >= r_offset:
+                    base_text = pred_data.get("base_text", "")
+                    new_text = base_text.replace("statut :⏳", "statut :❌")
+                    
+                    try:
+                        await client.edit_message(channel_id, msg_id, new_text)
+                        pred_data["verified"] = True
+                        pred_data["status"] = "❌"
+                        save_config()
+                        print(f"❌ Prédiction #{pred_numero} échouée après tous les essais (N+0 à N+{r_offset})")
+                    except Exception as e:
+                        print(f"❌ Erreur mise à jour prédiction #{pred_numero}: {e}")
+                else:
+                    # Continuer à surveiller pour le prochain offset
+                    save_config()
 
 async def verify_excel_predictions(game_number: int, message_text: str):
     """Fonction consolidée pour vérifier toutes les prédictions Excel en attente"""
@@ -411,15 +814,15 @@ async def update_prediction_status(pred: dict, numero: int, winner: str, status:
     if msg_id and channel_id:
         # Utiliser la nouvelle fonction (qui prend numero et winner) pour obtenir le format complet (incluant statut :⏳)
         full_base_text_with_placeholder = excel_manager.get_prediction_format(numero, winner)
-        
+
         # Le format complet est: 🔵{numero}:🅿️+6,5🔵statut :⏳
         # Nous devons remplacer la fin :⏳ par :{status}
-        
+
         # Sépare le texte avant 'statut :⏳' et prend la première partie
         base_format = full_base_text_with_placeholder.rsplit("statut :⏳", 1)[0]
-        
+
         # Reconstruit le message avec le nouveau statut
-        new_text = f"{base_format}statut :{status}" 
+        new_text = f"{base_format}statut :{status}"
 
         try:
             await client.edit_message(channel_id, msg_id, new_text)
@@ -435,39 +838,42 @@ async def update_prediction_status(pred: dict, numero: int, winner: str, status:
 async def start_command(event):
     """Send welcome message when user starts the bot"""
     try:
-        welcome_msg = """🎯 **Bot de Prédiction de Cartes - Bienvenue !**
+        welcome_msg = f"""🎯 **Bot de Prédiction de Cartes - Bienvenue !**
 
 🔹 **Développé par Sossou Kouamé Appolinaire**
 
 **Fonctionnalités** :
-• 📊 Import de prédictions depuis fichier Excel
 • 🔍 Surveillance automatique du canal source
-• 🎯 Lancement des prédictions basé sur le fichier Excel
-• ✅ Vérification des résultats avec offsets (0, 1, 2)
+• 🎯 Détection automatique du "6" dans le premier groupe
+• 📊 Prédiction basée sur #T (>10.5 = Joueur, ≤10.5 = Banquier)
+• ✅ Vérification automatique des résultats
 
 **Configuration** :
 1. Ajoutez-moi dans vos canaux
 2. Je vous enverrai automatiquement une invitation privée
 3. Répondez avec `/set_stat [ID]` ou `/set_display [ID]`
-4. Envoyez votre fichier Excel (.xlsx) pour importer les prédictions
 
-**Commandes** :
+**Commandes Admin** :
 • `/start` - Ce message
-• `/status` - État du bot (admin)
-• `/excel_status` - Statut des prédictions Excel (admin)
-• `/excel_clear` - Effacer les prédictions Excel (admin)
-• `/sta` - Statistiques Excel (admin)
-• `/reset` - Réinitialiser (admin)
+• `/status` - État du bot
+• `/a [valeur]` - Définir le décalage (N+a) [actuel: {a_offset}]
+• `/sta` - Statistiques des prédictions
+• `/reset` - Réinitialiser toutes les données
+• `/ni` - Informations système
+• `/set_stat [ID]` - Configurer canal source
+• `/set_display [ID]` - Configurer canal diffusion
+• `/force_set_stat [ID]` - Forcer config canal source
+• `/force_set_display [ID]` - Forcer config canal diffusion
 
-**Format Excel** :
-Le fichier doit contenir 3 colonnes :
-• Date & Heure
-• Numéro (ex: 881, 886, 891...)
-• Victoire (Joueur ou Banquier)
+**Logique de prédiction** :
+1. Détection d'un "6" dans le premier groupe de cartes
+2. Vérification que #T existe
+3. Si #T > 10.5 → 🔵N+a:🅿️+6,5🔵statut :⏳ (Joueur)
+4. Si #T ≤ 10.5 → 🔵N+a:Ⓜ️-4,,5🔵statut :⏳ (Banquier)
 
-**Format de prédiction** :
-• Joueur (P+6,5) : 🔵XXX:🅿️+6,5🔵statut :⏳
-• Banquier (M-4,5) : 🔵XXX:Ⓜ️-4,,5🔵statut :⏳
+**Exclusions** :
+• Match nul (🔰 entre groupes avec 🟣#X)
+• Total premier groupe = 6 ET carte 6 présente
 
 Le bot est prêt à analyser vos jeux ! 🚀"""
 
@@ -516,11 +922,11 @@ async def reset_data(event):
         if event.sender_id != ADMIN_ID:
             return
 
-        # Réinitialiser les prédictions en attente
-        pending_predictions.clear()
+        # Réinitialiser les données du predictor
+        predictor.reset()
 
         # Réinitialiser les données YAML
-        await yaml_manager.reset_all_data()
+        db.reset_all_data()
 
         msg = """🔄 **Données réinitialisées avec succès !**
 
@@ -567,7 +973,7 @@ async def ni_command(event):
 • `/set_display [ID]` - Configurer canal affichage
 • `/excel_status` - Voir prédictions Excel
 • `/reset` - Réinitialiser les données
-• `/intervalle [min]` - Configurer délai
+• `/deploy` - Créer package de déploiement
 
 ✅ **Bot opérationnel** - Version 2025"""
 
@@ -576,6 +982,52 @@ async def ni_command(event):
 
     except Exception as e:
         print(f"Erreur dans ni_command: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+@client.on(events.NewMessage(pattern='/deploy'))
+async def deploy_command(event):
+    """Créer un package zip de déploiement avec tous les fichiers à la racine"""
+    try:
+        if ADMIN_ID and event.sender_id != ADMIN_ID:
+            await event.respond("❌ Seul l'administrateur peut créer un package de déploiement")
+            return
+
+        await event.respond("📦 **Création du package fin2025 en cours...**")
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        zip_filename = f"fin2025_{timestamp}.zip"
+
+        # Liste des fichiers à inclure (tous à la racine)
+        files_to_include = [
+            'main.py', 'predictor.py', 'excel_importer.py', 'yaml_manager.py',
+            'requirements.txt', 'bot_config.json', 'Procfile', 'render.yaml'
+        ]
+
+        with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for file in files_to_include:
+                if os.path.exists(file):
+                    zipf.write(file, file)  # Fichier à la racine du zip
+
+        if os.path.exists(zip_filename):
+            file_size = os.path.getsize(zip_filename) / (1024 * 1024)
+            
+            await client.send_file(
+                event.chat_id,
+                zip_filename,
+                caption=f"📦 **Package fin2025 créé avec succès!**\n\n✅ Fichier: {zip_filename}\n💾 Taille: {file_size:.2f} MB\n🎯 Tous les fichiers à la racine\n🚀 Prêt pour déploiement Replit"
+            )
+            
+            try:
+                os.remove(zip_filename)
+            except:
+                pass
+            
+            print(f"✅ Package {zip_filename} créé et envoyé")
+        else:
+            await event.respond("❌ Erreur: Impossible de créer le fichier zip")
+            
+    except Exception as e:
+        print(f"❌ Erreur deploy_command: {e}")
         await event.respond(f"❌ Erreur: {e}")
 
 
@@ -608,7 +1060,7 @@ Ceci est un message de test pour vérifier les invitations."""
 async def show_excel_stats(event):
     """Show Excel predictions statistics"""
     try:
-        if event.sender_id != ADMIN_ID:
+        if ADMIN_ID and event.sender_id != ADMIN_ID:
             return
 
         # Recharger la configuration pour éviter les valeurs obsolètes
@@ -640,173 +1092,320 @@ async def show_excel_stats(event):
         print(f"Erreur dans show_excel_stats: {e}")
         await event.respond(f"❌ Erreur: {e}")
 
-# Commande /report supprimée selon demande utilisateur
-
-@client.on(events.NewMessage(pattern='/scheduler_disabled'))
-async def manage_scheduler_disabled(event):
-    """Gestion du planificateur automatique (admin uniquement)"""
-    global scheduler
+@client.on(events.NewMessage(pattern='/excel_clear'))
+async def clear_excel_predictions(event):
+    """Effacer toutes les prédictions Excel"""
     try:
-        if event.sender_id != ADMIN_ID:
+        if ADMIN_ID and event.sender_id != ADMIN_ID:
             return
 
-        # Parse command arguments
-        message_parts = event.message.message.split()
-        if len(message_parts) < 2:
-            await event.respond("""🤖 **Commandes du Planificateur Automatique**
+        old_count = len(excel_manager.predictions)
+        excel_manager.predictions.clear()
+        excel_manager.save_predictions()
 
-**Usage**: `/scheduler [commande]`
+        msg = f"""🗑️ **Prédictions Excel effacées**
 
-**Commandes disponibles**:
-• `start` - Démarre le planificateur automatique
-• `stop` - Arrête le planificateur
-• `status` - Affiche le statut actuel
-• `generate` - Génère une nouvelle planification
-• `config [source_id] [target_id]` - Configure les canaux
+✅ {old_count} prédictions supprimées
+📋 La base est maintenant vide
 
-**Exemple**: `/scheduler config -1001234567890 -1001987654321`""")
+Vous pouvez importer un nouveau fichier Excel."""
+
+        await event.respond(msg)
+        print(f"Prédictions Excel effacées par l'admin: {old_count} entrées")
+
+    except Exception as e:
+        print(f"Erreur dans clear_excel_predictions: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+# Commande /report et /scheduler supprimées (non utilisées)
+
+@client.on(events.NewMessage(func=lambda e: e.is_private and e.document))
+async def handle_excel_document(event):
+    """Détecte automatiquement les fichiers Excel envoyés par l'admin (sans commande)"""
+    try:
+        if ADMIN_ID and event.sender_id != ADMIN_ID:
             return
 
-        command = message_parts[1].lower()
+        if not event.message.file:
+            return
 
-        if command == "start":
-            if not scheduler:
-                if detected_stat_channel and detected_display_channel:
-                    scheduler = PredictionScheduler(
-                        client, predictor,
-                        detected_stat_channel, detected_display_channel
-                    )
-                    # Démarre le planificateur en arrière-plan
-                    asyncio.create_task(scheduler.run_scheduler())
-                    await event.respond("✅ **Planificateur démarré**\n\nLe système de prédictions automatiques est maintenant actif.")
-                else:
-                    await event.respond("❌ **Configuration manquante**\n\nVeuillez d'abord configurer les canaux source et cible avec `/set_stat` et `/set_display`.")
-            else:
-                await event.respond("⚠️ **Planificateur déjà actif**\n\nUtilisez `/scheduler stop...
+        mime_type = event.message.file.mime_type or ""
+        file_name = event.message.file.name or ""
 
-@client.on(events.NewMessage(chats=detected_stat_channel))
-async def handle_new_message(event):
-    """Handle new messages in the statistics channel"""
-    if event.is_channel and event.chat_id == detected_stat_channel:
-        message_text = event.raw_text
-        game_number = predictor.extract_game_number(message_text)
+        excel_mimes = [
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/vnd.ms-excel',
+            'application/octet-stream'
+        ]
+        excel_extensions = ['.xlsx', '.xls']
 
-        if game_number:
-            # Récupérer la dernière prédiction (pour la logique 'A')
-            prediction = predictor.last_predictions[-1] if predictor.last_predictions else None
+        is_excel = any(mime in mime_type for mime in excel_mimes) or any(file_name.lower().endswith(ext) for ext in excel_extensions)
 
-            # Lancement d'une prédiction Excel si nécessaire
-            if detected_display_channel and detected_stat_channel and game_number:
-                closest_pred = excel_manager.find_close_prediction(game_number)
+        if not is_excel:
+            return
 
-                if closest_pred:
-                    pred_key = closest_pred["key"]
-                    pred_numero = closest_pred["prediction"]["numero"]
-                    pred_victoire = closest_pred["prediction"]["victoire"]
+        print(f"📥 Fichier Excel détecté via Telegram: {file_name}")
+        await event.respond("📥 **Fichier Excel détecté! Téléchargement en cours...**")
 
-                    # --- MODIFICATION: Utiliser la nouvelle fonction et le nouveau format complet ---
-                    prediction_text = excel_manager.get_prediction_format(pred_numero, pred_victoire)
-
-                    try:
-                        sent_message = await client.send_message(detected_display_channel, prediction_text)
-                        excel_manager.mark_as_launched(pred_key, sent_message.id, detected_display_channel)
-                        ecart = pred_numero - game_number
-                        # Mise à jour du log pour afficher le nouveau format
-                        print(f"✅ Prédiction Excel lancée: {prediction_text} | Canal source: #{game_number} (écart: +{ecart} parties)")
-                    except Exception as e:
-                        print(f"❌ Erreur envoi prédiction Excel: {e}")
-
-            # Vérification SÉQUENTIELLE des prédictions Excel lancées
-            await verify_excel_predictions(game_number, message_text)
-            
-            # ... (Le reste du code de l'événement n'est pas modifié ici car non demandé) ...
-
-@client.on(events.NewMessage(pattern=r'/upload_excel', func=lambda e: e.is_private and e.sender_id == ADMIN_ID and e.media))
-async def handle_excel_upload(event):
-    """Handle Excel file upload from admin in private chat"""
-    try:
-        # Vérification MIME type pour s'assurer que c'est bien un fichier Excel
-        if not event.message.file or not any(mime in event.message.file.mime_type for mime in ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.ms-excel']):
-            return await event.respond("❌ **Erreur**: Veuillez envoyer un fichier au format `.xlsx` ou `.xls`.")
-
-        await event.respond("📥 **Téléchargement du fichier Excel...**")
         file_path = await event.message.download_media()
+
+        if not file_path:
+            await event.respond("❌ **Erreur**: Impossible de télécharger le fichier.")
+            return
 
         await event.respond("⚙️ **Importation des prédictions...**")
 
-        # MODE REMPLACEMENT AUTOMATIQUE : remplace toutes les anciennes prédictions
+        old_count = len(excel_manager.predictions)
         result = excel_manager.import_excel(file_path, replace_mode=True)
-        os.remove(file_path)
+
+        try:
+            os.remove(file_path)
+        except:
+            pass
 
         if result["success"]:
             stats = excel_manager.get_stats()
-            consecutive_info = f"\n• Numéros consécutifs ignorés: {result.get('consecutive_skipped', 0)}" if result.get('consecutive_skipped', 0) > 0 else ""
-            
-            # Information sur le mode d'import
-            mode_info = ""
-            if result.get('mode') == 'remplacement':
-                old_count = result.get('old_count', 0)
-                if old_count > 0:
-                    mode_info = f"\n🔄 **Mode**: Remplacement automatique ({old_count} anciennes prédictions remplacées)\n💾 **Backup**: Ancien fichier sauvegardé automatiquement"
-                else:
-                    mode_info = "\n🆕 **Mode**: Première importation"
-                    
-            msg = f"""✅ **Import Excel réussi!**
-📊 **Résumé**:
+            consecutive_info = result.get('consecutive_skipped', 0)
+
+            msg = f"""📥 Import Excel via Telegram
+
+✅ Fichier Excel importé avec succès!
 • Prédictions importées: {result['imported']}
-• Prédictions ignorées (déjà lancées): {result['skipped']}{consecutive_info}
-• Total en base: {stats['total']}{mode_info}
+• Anciennes remplacées: {old_count}
+• Consécutifs ignorés: {consecutive_info}
+• Total en base: {stats['total']}
+
+Le système est prêt pour les prédictions! 🎉
 
 📋 **Statistiques**:
 • En attente: {stats['pending']}
-• Lancées: {stats['launched']}
-
-⚠️ **Note**: Les numéros consécutifs (ex: 23→24) sont automatiquement filtrés pour éviter les doublons. Le système surveillera maintenant le canal source et lancera les prédictions automatiquement quand les numéros seront proches."""
+• Lancées: {stats['launched']}"""
 
             await event.respond(msg)
-            print(f"✅ Import Excel réussi: {result['imported']} prédictions importées, {result.get('consecutive_skipped', 0)} consécutifs ignorés.")
+            print(f"✅ Import Excel via Telegram réussi: {result['imported']} prédictions")
         else:
-            await event.respond(f"❌ **Erreur importation Excel**: {result['error']}")
-            print(f"❌ Erreur importation Excel: {result['error']}")
+            await event.respond(f"❌ **Erreur importation Excel**: {result.get('error', 'Erreur inconnue')}")
+            print(f"❌ Erreur importation Excel: {result.get('error')}")
 
     except Exception as e:
-        print(f"Erreur dans handle_excel_upload: {e}")
-        await event.respond(f"❌ **Erreur critique lors de l'import**: {e}")
-        # --- LOGIQUE PRINCIPALE : ÉCOUTE DU CANAL SOURCE ---
+        print(f"Erreur dans handle_excel_document: {e}")
+        await event.respond(f"❌ **Erreur critique**: {e}")
 
-@client.on(events.NewMessage(chats=detected_stat_channel))
+@client.on(events.NewMessage(pattern=r'/upload_excel', func=lambda e: e.is_private and e.sender_id == ADMIN_ID and e.media))
+async def handle_excel_upload(event):
+    """Handle Excel file upload from admin in private chat (legacy command)"""
+    pass
+
+# --- LOGIQUE PRINCIPALE : ÉCOUTE DU CANAL SOURCE ---
+
+@client.on(events.NewMessage())
+@client.on(events.MessageEdited())
 async def handle_new_message(event):
-    """Gère les nouveaux messages dans le canal de statistiques (source)"""
-    if event.is_channel and event.chat_id == detected_stat_channel:
-        message_text = event.raw_text
-        game_number = predictor.extract_game_number(message_text)
+    """
+    Gère les nouveaux messages ET les messages édités dans le canal de statistiques.
+    
+    Nouvelle logique de prédiction:
+    1. Détecte si le premier groupe contient un "6" dans les cartes
+    2. Si oui, vérifie la valeur #T
+    3. Si #T > 10.5 → prédit Joueur (🅿️+6,5)
+    4. Si #T <= 10.5 → prédit Banquier (Ⓜ️-4,,5)
+    5. Ignore les matchs nuls et les cas où total=6 ET carte=6
+    """
+    global active_predictions
+    
+    if not detected_stat_channel:
+        return
+    if not (event.is_channel and event.chat_id == detected_stat_channel):
+        return
+    
+    message_text = event.raw_text
+    game_number = predictor.extract_game_number(message_text)
+    
+    if not game_number:
+        return
+    
+    print(f"📨 Message reçu du canal source - Jeu #{game_number}")
+    
+    # --- ÉTAPE 1: VÉRIFICATION DES PRÉDICTIONS ACTIVES ---
+    await verify_active_predictions(game_number, message_text)
+    
+    # --- ÉTAPE 2: NOUVELLE PRÉDICTION BASÉE SUR LA DÉTECTION DU 6 ---
+    if not detected_display_channel:
+        print(f"⚠️ Canal de diffusion non configuré - impossible de lancer des prédictions")
+        return
+    
+    # Vérifier si le message est finalisé (✅ ou 🔰)
+    if not is_finalized_message(message_text):
+        print(f"⏳ Message #{game_number} pas encore finalisé - en attente")
+        return
+    
+    # Vérifier si on doit ignorer ce message
+    if should_skip_prediction(message_text):
+        print(f"⏭️ Message #{game_number} ignoré (match nul ou total=6 avec carte 6)")
+        return
+    
+    # Vérifier si le premier groupe contient un 6
+    if not has_six_in_first_group(message_text):
+        print(f"ℹ️ Pas de 6 dans le premier groupe du jeu #{game_number} - pas de prédiction")
+        return
+    
+    # Extraire la valeur #T
+    t_value = extract_t_value(message_text)
+    if t_value < 0:
+        print(f"⚠️ Impossible d'extraire #T du jeu #{game_number}")
+        return
+    
+    # Calculer le numéro de prédiction: N + a
+    predicted_numero = game_number + a_offset
+    
+    # Vérifier si une prédiction existe déjà pour ce numéro
+    if str(predicted_numero) in active_predictions:
+        print(f"ℹ️ Prédiction #{predicted_numero} déjà existante - ignorée")
+        return
+    
+    # Déterminer le type de prédiction
+    if t_value > 10.5:
+        prediction_type = "joueur"
+        prediction_text = f"🔵{predicted_numero}:🅿️+6,5🔵statut :⏳"
+        print(f"🎯 #T={t_value} > 10.5 → Prédiction JOUEUR pour #{predicted_numero}")
+    else:
+        prediction_type = "banquier"
+        prediction_text = f"🔵{predicted_numero}:Ⓜ️-4,,5🔵statut :⏳"
+        print(f"🎯 #T={t_value} <= 10.5 → Prédiction BANQUIER pour #{predicted_numero}")
+    
+    # Envoyer la prédiction
+    try:
+        sent_message = await client.send_message(detected_display_channel, prediction_text)
+        
+        # Enregistrer la prédiction active
+        active_predictions[str(predicted_numero)] = {
+            "message_id": sent_message.id,
+            "channel_id": detected_display_channel,
+            "expected": prediction_type,
+            "base_text": prediction_text,
+            "source_game": game_number,
+            "t_value": t_value,
+            "verified": False,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        save_config()
+        
+        print(f"✅ Prédiction lancée: {prediction_text} (source: #{game_number}, #T={t_value})")
+        
+    except Exception as e:
+        print(f"❌ Erreur envoi prédiction: {e}")
 
-        if game_number:
-            # --- ÉTAPE 1: LANCEMENT DE LA PRÉDICTION EXCEL ---
-            if detected_display_channel and detected_stat_channel:
-                # Trouver la prédiction la plus proche (dans la tolérance)
-                closest_pred = excel_manager.find_close_prediction(game_number)
+# --- DÉTECTION AUTOMATIQUE DES FICHIERS EXCEL ---
 
-                if closest_pred:
-                    pred_key = closest_pred["key"]
-                    pred_numero = closest_pred["prediction"]["numero"]
-                    pred_victoire = closest_pred["prediction"]["victoire"]
+def get_excel_files_in_project():
+    """Retourne la liste des fichiers Excel dans le répertoire du projet"""
+    excel_patterns = ["*.xlsx", "*.xls"]
+    excel_files = []
+    for pattern in excel_patterns:
+        excel_files.extend(glob.glob(os.path.join(EXCEL_WATCH_DIR, pattern)))
+    return excel_files
 
-                    # Création du message avec le nouveau format (ex: 🔵XXX:🅿️+6,5🔵statut :⏳)
-                    prediction_text = excel_manager.get_prediction_format(pred_numero, pred_victoire)
+def load_processed_files():
+    """Charge la liste des fichiers déjà traités depuis un fichier de persistance"""
+    global processed_excel_files
+    try:
+        processed_file = "processed_excel_files.json"
+        if os.path.exists(processed_file):
+            with open(processed_file, 'r') as f:
+                data = json.load(f)
+                processed_excel_files = set(data.get('files', []))
+    except Exception as e:
+        print(f"⚠️ Erreur chargement fichiers traités: {e}")
+        processed_excel_files = set()
 
-                    try:
-                        sent_message = await client.send_message(detected_display_channel, prediction_text)
-                        # Marquer comme lancé et enregistrer l'ID du message
-                        excel_manager.mark_as_launched(pred_key, sent_message.id, detected_display_channel)
-                        ecart = pred_numero - game_number
-                        print(f"✅ Prédiction Excel lancée: {prediction_text} | Canal source: #{game_number} (écart: +{ecart} parties)")
-                    except Exception as e:
-                        print(f"❌ Erreur envoi prédiction Excel: {e}")
+def save_processed_files():
+    """Sauvegarde la liste des fichiers traités"""
+    try:
+        processed_file = "processed_excel_files.json"
+        with open(processed_file, 'w') as f:
+            json.dump({'files': list(processed_excel_files)}, f)
+    except Exception as e:
+        print(f"⚠️ Erreur sauvegarde fichiers traités: {e}")
 
-            # --- ÉTAPE 2: VÉRIFICATION DES PRÉDICTIONS EXCEL LANCÉES ---
-            await verify_excel_predictions(game_number, message_text)
-            
+async def check_new_excel_files():
+    """Vérifie s'il y a de nouveaux fichiers Excel dans le projet"""
+    global processed_excel_files
+
+    try:
+        current_files = get_excel_files_in_project()
+
+        for file_path in current_files:
+            file_name = os.path.basename(file_path)
+            file_mtime = os.path.getmtime(file_path)
+            file_key = f"{file_name}_{file_mtime}"
+
+            if file_key not in processed_excel_files:
+                print(f"📥 Nouveau fichier Excel détecté: {file_name}")
+                await auto_import_excel(file_path)
+                processed_excel_files.add(file_key)
+                save_processed_files()
+
+    except Exception as e:
+        print(f"⚠️ Erreur vérification fichiers Excel: {e}")
+
+async def auto_import_excel(file_path: str):
+    """Importe automatiquement un fichier Excel et envoie la confirmation à l'admin"""
+    try:
+        file_name = os.path.basename(file_path)
+        print(f"📥 Import Automatique: {file_name}")
+
+        old_count = len(excel_manager.predictions)
+        result = excel_manager.import_excel(file_path, replace_mode=True)
+
+        if result["success"]:
+            stats = excel_manager.get_stats()
+            consecutive_info = result.get('consecutive_skipped', 0)
+
+            msg = f"""📥 Import Automatique dans Projet
+
+✅ Fichier Excel importé avec succès!
+• Prédictions importées: {result['imported']}
+• Anciennes remplacées: {old_count}
+• Consécutifs ignorés: {consecutive_info}
+• Total en base: {stats['total']}
+
+Le système est prêt pour la nouvelle journée! 🎉"""
+
+            print(msg)
+
+            if ADMIN_ID:
+                try:
+                    await client.send_message(ADMIN_ID, msg)
+                    print(f"✅ Message de confirmation envoyé à l'admin")
+                except Exception as e:
+                    print(f"⚠️ Impossible d'envoyer le message à l'admin: {e}")
+        else:
+            error_msg = f"❌ Erreur import Excel automatique: {result.get('error', 'Erreur inconnue')}"
+            print(error_msg)
+            if ADMIN_ID:
+                try:
+                    await client.send_message(ADMIN_ID, error_msg)
+                except:
+                    pass
+
+    except Exception as e:
+        print(f"❌ Erreur import automatique: {e}")
+
+async def excel_file_watcher():
+    """Boucle de surveillance des fichiers Excel (toutes les 10 secondes)"""
+    load_processed_files()
+    print("👀 Surveillance des fichiers Excel activée")
+
+    while True:
+        try:
+            await check_new_excel_files()
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"⚠️ Erreur dans le watcher Excel: {e}")
+            await asyncio.sleep(30)
+
 # --- FONCTIONS UTILITAIRES POUR LE SERVEUR WEB ---
 
 async def health_check(request):
@@ -855,7 +1454,14 @@ async def main():
         if await start_bot():
             print("✅ Bot en ligne et en attente de messages...")
             print(f"🌐 Accès web: http://0.0.0.0:{PORT}")
+
+            # Démarrage du surveillant de fichiers Excel en arrière-plan
+            excel_watcher_task = asyncio.create_task(excel_file_watcher())
+
             await client.run_until_disconnected()
+
+            # Annuler le watcher quand le bot s'arrête
+            excel_watcher_task.cancel()
         else:
             print("❌ Échec du démarrage du bot")
 
@@ -863,12 +1469,11 @@ async def main():
         print("\n🛑 Arrêt du bot demandé par l'utilisateur")
     except Exception as e:
         print(f"❌ Erreur critique: {e}")
-        
+
 if __name__ == '__main__':
     try:
-        asyncio.run(main()) 
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("Arrêt du script.")
     except Exception as e:
         print(f"Erreur fatale à l'exécution: {e}")
-    

@@ -118,12 +118,13 @@ class CardPredictor:
     def verify_prediction(self, message: str) -> Tuple[Optional[bool], Optional[int]]:
         """Verify prediction results based on verification message"""
         try:
-            # NOUVELLE LOGIQUE: Ignorer complètement les messages ⏰ et 🕐 pour la vérification
+            # LOGIQUE ATTENTE: Si message en cours d'édition (⏰ ou 🕐), on ATTEND la finalisation
+            # Le bot recevra un événement MessageEdited quand le message sera finalisé
             if "⏰" in message or "🕐" in message:
-                print(f"⏰/🕐 détecté dans le message - ignoré pour la vérification")
-                return None, None
+                print(f"⏰/🕐 détecté - Message en cours d'édition, ATTENTE de finalisation (✅ ou 🔰)")
+                return None, None  # None = pas de décision, on attend le prochain événement
 
-            # Check for verification tags (uniquement messages normaux)
+            # Vérifier si le message est finalisé (uniquement avec ✅ ou 🔰)
             if not any(tag in message for tag in ["✅", "🔰", "❌", "⭕"]):
                 return None, None
 
